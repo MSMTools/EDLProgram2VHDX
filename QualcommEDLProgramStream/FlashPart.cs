@@ -11,5 +11,15 @@
         {
             get; set;
         }
+
+        public long FileOffset
+        {
+            get; set;
+        }
+
+        public long Length
+        {
+            get; set;
+        }
     }
 }

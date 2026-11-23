@@ -30,6 +30,11 @@ namespace QualcommEDLProgramStream.XML
         {
             get; set;
         }
+        [XmlAttribute(AttributeName = "file_sector_offset")]
+        public string File_sector_offset
+        {
+            get; set;
+        } = "0";
         [XmlAttribute(AttributeName = "SECTOR_SIZE_IN_BYTES")]
         public string SECTOR_SIZE_IN_BYTES
         {

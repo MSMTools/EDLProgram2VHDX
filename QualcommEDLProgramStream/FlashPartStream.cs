@@ -4,11 +4,13 @@
     {
         private readonly long length;
 
-        private long currentPosition = 0;
+        private readonly List<FlashPart> flashParts;
+        private long currentPosition;
+        private bool disposed;
 
-        public override bool CanRead => true;
+        public override bool CanRead => !disposed;
 
-        public override bool CanSeek => true;
+        public override bool CanSeek => !disposed;
 
         public override bool CanWrite => false;
 
@@ -19,27 +21,38 @@
             get => currentPosition;
             set
             {
-                if (currentPosition < 0)
+                if (value < 0)
                 {
                     throw new ArgumentOutOfRangeException(nameof(value));
                 }
-
-                // Workaround for malformed MBRs
-                /*if (currentPosition > Length)
-                {
-                    throw new EndOfStreamException();
-                }*/
 
                 currentPosition = value;
             }
         }
 
-        private List<FlashPart> flashParts;
-
         public FlashPartStream(ulong totalLength, List<FlashPart> flashParts)
         {
-            this.flashParts = flashParts;
-            length = (long)totalLength;
+            length = checked((long)totalLength);
+            this.flashParts = flashParts.OrderBy(part => part.LocationOnDisk).ToList();
+            ulong previousEnd = 0;
+            foreach (FlashPart part in this.flashParts)
+            {
+                if (part.FileOffset < 0 || part.Length < 0 || part.FileOffset > part.Data.Length ||
+                    part.Length > part.Data.Length - part.FileOffset || part.LocationOnDisk > totalLength ||
+                    (ulong)part.Length > totalLength - part.LocationOnDisk)
+                {
+                    throw new InvalidDataException("Flash part exceeds its source file or the disk capacity.");
+                }
+                if (part.Length == 0)
+                {
+                    continue;
+                }
+                if (part.LocationOnDisk < previousEnd)
+                {
+                    throw new InvalidDataException("Flash parts overlap on disk.");
+                }
+                previousEnd = part.LocationOnDisk + (ulong)part.Length;
+            }
         }
 
         public override void Flush()
@@ -49,101 +62,80 @@
 
         public override int Read(byte[] buffer, int offset, int count)
         {
-            int bytesToRead = count;
-            if (currentPosition + bytesToRead > length)
+            ObjectDisposedException.ThrowIf(disposed, this);
+            ArgumentNullException.ThrowIfNull(buffer);
+            ArgumentOutOfRangeException.ThrowIfNegative(offset);
+            ArgumentOutOfRangeException.ThrowIfNegative(count);
+            if (count > buffer.Length - offset)
             {
-                bytesToRead = (int)(length - currentPosition);
+                throw new ArgumentException("Buffer range is out of bounds.");
+            }
+            if (currentPosition >= length)
+            {
+                return 0;
             }
 
-            long i = currentPosition;
-            while (i < currentPosition + bytesToRead)
+            int bytesToRead = (int)Math.Min(count, length - currentPosition);
+            Array.Clear(buffer, offset, bytesToRead);
+            long readEnd = currentPosition + bytesToRead;
+            foreach (FlashPart part in flashParts)
             {
-                bool foundPart = false;
-                foreach (FlashPart flashPart in flashParts)
+                long partStart = (long)part.LocationOnDisk;
+                if (partStart >= readEnd)
                 {
-                    if (flashPart.LocationOnDisk <= (ulong)i && (ulong)i < flashPart.LocationOnDisk + (ulong)flashPart.Data.Length)
-                    {
-                        long StreamPos = i - (long)flashPart.LocationOnDisk;
-                        flashPart.Data.Seek(StreamPos, SeekOrigin.Begin);
-
-                        long currentForProgressIndex = i - currentPosition;
-
-                        int toRead = (int)(bytesToRead - currentForProgressIndex);
-                        if (toRead > flashPart.Data.Length - StreamPos)
-                        {
-                            toRead = (int)(flashPart.Data.Length - StreamPos);
-                        }
-
-                        int bufferOffset = (int)(offset + currentForProgressIndex);
-                        flashPart.Data.Read(buffer, bufferOffset, toRead);
-                        i += toRead;
-
-                        foundPart = true;
-                    }
+                    break;
+                }
+                long partEnd = partStart + part.Length;
+                if (partEnd <= currentPosition)
+                {
+                    continue;
                 }
 
-                if (!foundPart)
-                {
-                    foreach (FlashPart flashPart in flashParts.OrderBy(t => t.LocationOnDisk))
-                    {
-                        if (flashPart.LocationOnDisk > (ulong)i)
-                        {
-                            i = (long)flashPart.LocationOnDisk;
-                            break;
-                        }
-                    }
-                }
+                long start = Math.Max(currentPosition, partStart);
+                int toRead = (int)(Math.Min(readEnd, partEnd) - start);
+                part.Data.Position = part.FileOffset + (start - partStart);
+                part.Data.ReadExactly(buffer.AsSpan(offset + (int)(start - currentPosition), toRead));
             }
 
-            currentPosition += bytesToRead;
+            currentPosition = readEnd;
             return bytesToRead;
         }
 
         public override long Seek(long offset, SeekOrigin origin)
         {
-            switch (origin)
+            ObjectDisposedException.ThrowIf(disposed, this);
+            Position = origin switch
             {
-                case SeekOrigin.Begin:
-                    {
-                        Position = offset;
-                        break;
-                    }
-                case SeekOrigin.Current:
-                    {
-                        Position += offset;
-                        break;
-                    }
-                case SeekOrigin.End:
-                    {
-                        Position = Length + offset;
-                        break;
-                    }
-                default:
-                    {
-                        throw new ArgumentException(nameof(origin));
-                    }
-            }
+                SeekOrigin.Begin => offset,
+                SeekOrigin.Current => checked(Position + offset),
+                SeekOrigin.End => checked(Length + offset),
+                _ => throw new ArgumentException(nameof(origin))
+            };
 
             return Position;
         }
 
         public override void SetLength(long value)
         {
-            throw new NotImplementedException();
+            throw new NotSupportedException();
         }
 
         public override void Write(byte[] buffer, int offset, int count)
         {
-            throw new NotImplementedException();
+            throw new NotSupportedException();
         }
 
-        ~FlashPartStream()
+        protected override void Dispose(bool disposing)
         {
-            // Cleanup
-            foreach (FlashPart flashingPartition in flashParts)
+            if (disposing && !disposed)
             {
-                flashingPartition.Data.Close();
+                disposed = true;
+                foreach (FlashPart part in flashParts)
+                {
+                    part.Data.Dispose();
+                }
             }
+            base.Dispose(disposing);
         }
     }
 }

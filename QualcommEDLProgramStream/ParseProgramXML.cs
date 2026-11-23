@@ -1,4 +1,5 @@
 ﻿using QualcommEDLProgramStream.XML;
+using System.Globalization;
 
 namespace QualcommEDLProgramStream
 {
@@ -6,64 +7,119 @@ namespace QualcommEDLProgramStream
     {
         public static Stream? GetStream(string inputXmlStr, uint sectorSize)
         {
-            Data data = XmlReader.DeserializeDataXmlFile(inputXmlStr);
-
-            foreach (XML.Program program in data.Program)
+            if (sectorSize != 512 && sectorSize != 4096)
             {
-                if (program.Label == "PrimaryGPT")
-                {
-                    GPT.GPT gpt = new(File.ReadAllBytes(Path.Combine(Path.GetDirectoryName(inputXmlStr)!, program.Filename)), sectorSize);
-                    ulong diskSize = (gpt.LastUsableSector + 1) * sectorSize;
-
-                    Console.WriteLine($"Disk size: {diskSize}");
-
-                    List<FlashPart> flashingPartitions = [];
-
-                    foreach (XML.Program dataProgram in data.Program)
-                    {
-                        if (string.IsNullOrEmpty(dataProgram.Filename))
-                        {
-                            continue;
-                        }
-
-                        string startSector = dataProgram.Start_sector;
-                        startSector = startSector.Replace("NUM_DISK_SECTORS", (gpt.LastUsableSector + 1).ToString());
-                        startSector = startSector.Trim('.');
-
-                        Console.WriteLine($"STR: {startSector}");
-
-                        ulong startSectorLong = 0;
-
-                        if (startSector.EndsWith("-5"))
-                        {
-                            string newStr = startSector[..^2];
-                            startSectorLong = ulong.Parse(newStr) - 5;
-                        }
-                        else
-                        {
-                            startSectorLong = ulong.Parse(startSector);
-                        }
-
-                        Console.WriteLine($"UL: {startSectorLong}");
-
-                        FlashPart flashPart = new()
-                        {
-                            LocationOnDisk = startSectorLong * sectorSize,
-                            Data = File.OpenRead(Path.Combine(Path.GetDirectoryName(inputXmlStr)!, dataProgram.Filename))
-                        };
-
-                        flashingPartitions.Add(flashPart);
-                    }
-
-                    Console.WriteLine($"FlashPart counts: {flashingPartitions.Count}");
-
-                    FlashPartStream flashPartStream = new(diskSize, flashingPartitions);
-
-                    return flashPartStream;
-                }
+                throw new ArgumentOutOfRangeException(nameof(sectorSize));
             }
 
-            return null;
+            Data data = XmlReader.DeserializeDataXmlFile(inputXmlStr);
+            XML.Program? primaryGPT = data.Program?.FirstOrDefault(program => program.Label == "PrimaryGPT");
+            if (primaryGPT == null)
+            {
+                return null;
+            }
+
+            string inputDirectory = Path.GetDirectoryName(Path.GetFullPath(inputXmlStr))!;
+            byte[] gptBuffer = File.ReadAllBytes(Path.Combine(inputDirectory, primaryGPT.Filename));
+            ulong gptFileOffset = checked(ParseSectorValue(primaryGPT.File_sector_offset, 0) * sectorSize);
+            if (gptFileOffset > (ulong)gptBuffer.Length)
+            {
+                throw new InvalidDataException("Primary GPT file offset exceeds the file length.");
+            }
+
+            GPT.GPT gpt = new(gptFileOffset == 0 ? gptBuffer : gptBuffer[(int)gptFileOffset..], sectorSize);
+            ulong diskSectors = checked(gpt.BackupSector + 1);
+            ulong diskSize = checked(diskSectors * sectorSize);
+            if (gpt.BackupSector <= gpt.LastUsableSector)
+            {
+                throw new InvalidDataException("Backup GPT is not beyond the usable sectors.");
+            }
+
+            Console.WriteLine($"Disk size: {diskSize}");
+            List<FlashPart> flashingPartitions = [];
+            try
+            {
+                foreach (XML.Program program in data.Program!)
+                {
+                    if (string.IsNullOrEmpty(program.Filename))
+                    {
+                        continue;
+                    }
+
+                    if (!string.IsNullOrEmpty(program.SECTOR_SIZE_IN_BYTES) &&
+                        ParseSectorValue(program.SECTOR_SIZE_IN_BYTES, diskSectors) != sectorSize)
+                    {
+                        throw new InvalidDataException($"Sector size mismatch for '{program.Filename}'.");
+                    }
+
+                    ulong startSector = ParseSectorValue(program.Start_sector, diskSectors);
+                    ulong sectorCount = ParseSectorValue(program.Num_partition_sectors, diskSectors);
+                    long fileOffset = checked((long)(ParseSectorValue(program.File_sector_offset, diskSectors) * sectorSize));
+                    FileStream file = File.OpenRead(Path.Combine(inputDirectory, program.Filename));
+                    try
+                    {
+                        if (fileOffset > file.Length)
+                        {
+                            throw new InvalidDataException($"File offset exceeds the length of '{program.Filename}'.");
+                        }
+
+                        long availableBytes = file.Length - fileOffset;
+                        long length = sectorCount == 0 ? availableBytes : checked((long)(sectorCount * sectorSize));
+                        if (length > availableBytes)
+                        {
+                            throw new InvalidDataException($"'{program.Filename}' is shorter than the declared sector range.");
+                        }
+
+                        flashingPartitions.Add(new FlashPart
+                        {
+                            LocationOnDisk = checked(startSector * sectorSize),
+                            Data = file,
+                            FileOffset = fileOffset,
+                            Length = length
+                        });
+                    }
+                    catch
+                    {
+                        file.Dispose();
+                        throw;
+                    }
+                }
+
+                return new FlashPartStream(diskSize, flashingPartitions);
+            }
+            catch
+            {
+                foreach (FlashPart part in flashingPartitions)
+                {
+                    part.Data.Dispose();
+                }
+                throw;
+            }
+        }
+
+        private static ulong ParseSectorValue(string value, ulong diskSectors)
+        {
+            value = value.Trim().TrimEnd('.');
+            const string diskToken = "NUM_DISK_SECTORS";
+            if (!value.StartsWith(diskToken, StringComparison.Ordinal))
+            {
+                return ulong.Parse(value, NumberStyles.None, CultureInfo.InvariantCulture);
+            }
+
+            string adjustment = value[diskToken.Length..].Trim();
+            if (adjustment.Length == 0)
+            {
+                return diskSectors;
+            }
+
+            char operation = adjustment[0];
+            if (operation != '+' && operation != '-')
+            {
+                throw new FormatException($"Invalid sector expression '{value}'.");
+            }
+
+            ulong amount = ulong.Parse(adjustment[1..].Trim(), NumberStyles.None, CultureInfo.InvariantCulture);
+            return operation == '+' ? checked(diskSectors + amount) : checked(diskSectors - amount);
         }
     }
 }
