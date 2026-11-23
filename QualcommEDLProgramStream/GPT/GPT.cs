@@ -35,6 +35,7 @@ namespace QualcommEDLProgramStream.GPT
         private readonly uint MaxPartitions;
         internal ulong FirstUsableSector;
         internal ulong LastUsableSector;
+        internal ulong BackupSector;
         internal bool HasChanged = false;
 
         public List<Partition> Partitions = [];
@@ -60,6 +61,7 @@ namespace QualcommEDLProgramStream.GPT
             HeaderOffset = (uint)TempHeaderOffset;
             HeaderSize = ByteOperations.ReadUInt32(GPTBuffer, HeaderOffset + 0x0C);
             TableOffset = HeaderOffset + SectorSize;
+            BackupSector = ByteOperations.ReadUInt64(GPTBuffer, HeaderOffset + 0x20);
             FirstUsableSector = ByteOperations.ReadUInt64(GPTBuffer, HeaderOffset + 0x28);
             LastUsableSector = ByteOperations.ReadUInt64(GPTBuffer, HeaderOffset + 0x30);
             MaxPartitions = ByteOperations.ReadUInt32(GPTBuffer, HeaderOffset + 0x50);
